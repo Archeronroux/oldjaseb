@@ -23,7 +23,6 @@ async function sendTokenBackupIfAny(ctx) {
   try {
     const a = getAcc(ctx.from.id) || (() => {
       const u = getUser(ctx.from.id);
-      // fallback: ambil akun pertama jika ada
       for (const [, acc] of (u?.accounts || new Map()).entries()) return acc;
       return null;
     })();
@@ -56,7 +55,6 @@ async function maybeNotifyExpiry(ctx) {
   const now = Date.now();
   let notified = false;
 
-  // PRO expired
   if (u.role === 'pro' && u.pro_expires_at != null && now > Number(u.pro_expires_at)) {
     const last = u.pro_notified_at || 0;
     if (Number(last) < Number(u.pro_expires_at)) {
@@ -70,7 +68,6 @@ async function maybeNotifyExpiry(ctx) {
     }
   }
 
-  // TRIAL expired
   if (u.role === 'trial' && u.trial_expires_at != null && now > Number(u.trial_expires_at)) {
     const last = u.trial_notified_at || 0;
     if (Number(last) < Number(u.trial_expires_at)) {
@@ -98,10 +95,8 @@ function entitlementGate() {
       const data = String(ctx.callbackQuery?.data || '');
       const text = ctx.message?.text || '';
 
-      // Bypass flow interaktif (login, input nomor/OTP/2FA)
       const inInteractiveFlow = !!ctx.session?.act;
 
-      // Bypass tombol penting
       const bypassTexts = new Set([
         STR.menu.tokenMenu,
         STR.menu.back,
@@ -117,15 +112,15 @@ function entitlementGate() {
       const isImageDoc = ctx.message?.document && /^image\//i.test(ctx.message.document.mime_type || '');
       const isContact = !!ctx.message?.contact;
 
-      // OTP 3-8 digit (boleh ada spasi antar digit)
       const isOtpText = /^\s*(?:\d\s*){3,8}$/.test(text);
 
       const isShopCb = isCb && /^action:shop:/.test(data);
       const isCancelCb = isCb && /^cancel_/.test(data);
+      const isResendCb = isCb && /^resend_/.test(data);
       const isBypassText = bypassTexts.has(text);
       const isProofImage = !!(hasPhoto || isImageDoc);
 
-      if (isShopCb || isBypassText || isProofImage || isContact || isOtpText || inInteractiveFlow || isCancelCb) {
+      if (isShopCb || isBypassText || isProofImage || isContact || isOtpText || inInteractiveFlow || isCancelCb || isResendCb) {
         return next();
       }
 

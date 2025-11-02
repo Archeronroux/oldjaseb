@@ -13,6 +13,7 @@ const STR = require('../config/strings');
 const { getBot } = require('../utils/helper'); // tambahan untuk notifikasi otomatis
 
 const DEBUG = process.env.DEBUG_BROADCAST === '1';
+const DEBUG_LOGIN = process.env.DEBUG_LOGIN === '1' || DEBUG;
 const FORCE_HTML = process.env.FORCE_HTML === '1';
 
 const debugFile = path.join(sessionsDir, 'debug.log');
@@ -20,6 +21,7 @@ function log(line) {
   if (!DEBUG) return;
   try { fs.appendFileSync(debugFile, new Date().toISOString() + ' ' + line + '\n'); } catch {}
 }
+function ldbg(...a){ if (DEBUG_LOGIN) console.log('[LOGINDBG]', ...a); }
 
 class Akun {
   constructor(uid) {
@@ -185,79 +187,121 @@ class Akun {
     }
   }
 
+  // Perbaikan: pastikan client connect dulu, dan tambah logging/penanganan error agar OTP send failure terlihat
   async login(ctx, phone) {
     try {
       const loading = await ctx.reply('⏳ *Tunggu sebentar...*', { parse_mode: 'Markdown' });
       this.loadingMsgId = loading.message_id;
     } catch {}
-    await this.init();
+
+    // Inisialisasi client
+    try {
+      await this.init();
+    } catch (e) {
+      await this._safeDeleteLoading(ctx);
+      console.error('[Akun.login] init failed:', e);
+      try { await ctx.reply('❌ Gagal inisialisasi client: ' + (e.message || e)); } catch {}
+      throw e;
+    }
+
     if (!this.client) {
       await this._safeDeleteLoading(ctx);
       return ctx.reply('❌ Gagal init client.');
     }
 
-    this.client.start({
-      phoneNumber: () => phone,
-      phoneCode: () => new Promise(r => {
-        this.pendingCode = r;
-        this._safeDeleteLoading(ctx);
-        const { InlineKeyboard } = require('grammy');
-        ctx.api.sendMessage(this.uid, STR.messages.otpInfo, {
-          parse_mode: 'Markdown',
-          reply_markup: new InlineKeyboard().text('❌ Batal', `cancel_${this.uid}`)
-        }).then(msg => this.pendingMsgId = msg.message_id).catch(()=>{});
-      }),
-      password: () => new Promise(r => {
-        this.pendingPass = r;
-        this._safeDeleteLoading(ctx);
-        const { InlineKeyboard } = require('grammy');
-        ctx.api.sendMessage(this.uid, STR.messages.passwordAsk, {
-          reply_markup: new InlineKeyboard().text('❌ Batal', `cancel_${this.uid}`)
-        }).then(msg => this.pendingMsgId = msg.message_id).catch(()=>{});
-      }),
-      onError: e => {
-        try { ctx.api.sendMessage(this.uid, `Error: ${e.message}`); } catch {}
+    // Pastikan terconnect sebelum start -- ini sering jadi penyebab OTP tidak dikirim
+    try {
+      if (!this.client.connected) {
+        ldbg('Connecting client before start()...');
+        await this.client.connect();
+        ldbg('Client connected.');
       }
-    }).then(async () => {
-      try {
-        this.sess = this.client.session.save();
-        this.authed = true;
-        const me = await this.client.getMe();
-        this.name = me?.firstName || me?.username || 'User';
-        this.isPremium = !!me?.premium;
-        this._profileFetched = true;
-        this.cleanup(ctx);
-        await this._safeDeleteLoading(ctx);
+    } catch (e) {
+      await this._safeDeleteLoading(ctx);
+      console.error('[Akun.login] client.connect failed:', e);
+      try { await ctx.reply('❌ Gagal connect ke Telegram: ' + (e.message || e)); } catch {}
+      throw e;
+    }
 
-        log(`[LOGIN] uid=${this.uid} premium=${this.isPremium}`);
+    // Now start() with clearer error handling and debug logs
+    const onError = (err) => {
+      try { ctx.api.sendMessage(this.uid, `Error saat login: ${err.message || err}`); } catch {}
+      console.error('[Akun.login] start onError:', err);
+    };
 
-        try {
-          const { saveState } = require('../utils/persist');
-          const { users } = require('../utils/helper');
-          saveState(users);
-        } catch (e) {
-          console.error('[Akun.login] saveState error:', e.message);
-        }
-
-        const welcome = STR.messages.welcomeAuthed(this.name, 'Mati');
-        await this._sendWelcomeWithEffects(ctx.api, welcome);
-
-        const { mainMenu } = require('../utils/menu');
-        const menu = mainMenu({ from: { id: this.uid, first_name: this.name } });
-        await ctx.api.sendMessage(this.uid, menu.text, {
-          reply_markup: menu.reply_markup,
-          parse_mode: menu.parse_mode
-        });
-
-      } catch (e) {
-        console.error('[Akun.login] success flow error:', e);
-        try { await ctx.api.sendMessage(this.uid, '⚠️ Masalah setelah login: ' + (e.message || e)); } catch {}
+    try {
+      await this.client.start({
+        phoneNumber: () => phone,
+        phoneCode: () => new Promise(r => {
+          this.pendingCode = r;
+          this._safeDeleteLoading(ctx);
+          const { InlineKeyboard } = require('grammy');
+          ctx.api.sendMessage(this.uid, STR.messages.otpInfo, {
+            parse_mode: 'Markdown',
+            reply_markup: new InlineKeyboard().text('❌ Batal', `cancel_${this.uid}`)
+          }).then(msg => this.pendingMsgId = msg.message_id).catch(()=>{});
+          ldbg('Prompted user for OTP');
+        }),
+        password: () => new Promise(r => {
+          this.pendingPass = r;
+          this._safeDeleteLoading(ctx);
+          const { InlineKeyboard } = require('grammy');
+          ctx.api.sendMessage(this.uid, STR.messages.passwordAsk, {
+            reply_markup: new InlineKeyboard().text('❌ Batal', `cancel_${this.uid}`)
+          }).then(msg => this.pendingMsgId = msg.message_id).catch(()=>{});
+          ldbg('Prompted user for 2FA password');
+        }),
+        onError
+      });
+    } catch (e) {
+      // jika start() gagal, laporkan ke user & log lebih lengkap
+      await this._safeDeleteLoading(ctx);
+      this.cleanup(ctx);
+      console.error('[Akun.login] client.start failed:', e && e.stack ? e.stack : e);
+      try { await ctx.reply('❌ Login gagal saat memulai proses (start): ' + (e.message || String(e))); } catch {}
+      // jika ini adalah error migrate DC atau hard auth -> coba laporkan khusus
+      if (String(e.message || '').toUpperCase().includes('MIGRATE')) {
+        ldbg('Start failed due to migrate DC:', e.message);
       }
-    }).catch(async (e) => {
+      throw e;
+    }
+
+    // Sukses start
+    try {
+      this.sess = this.client.session.save();
+      this.authed = true;
+      const me = await this.client.getMe();
+      this.name = me?.firstName || me?.username || 'User';
+      this.isPremium = !!me?.premium;
+      this._profileFetched = true;
       this.cleanup(ctx);
       await this._safeDeleteLoading(ctx);
-      try { await ctx.api.sendMessage(this.uid, `❌ Login gagal: ${e.message}`); } catch {}
-    });
+
+      ldbg(`[LOGIN_OK] uid=${this.uid} premium=${this.isPremium}`);
+
+      try {
+        const { saveState } = require('../utils/persist');
+        const { users } = require('../utils/helper');
+        saveState(users);
+      } catch (e) {
+        console.error('[Akun.login] saveState error:', e.message);
+      }
+
+      const welcome = STR.messages.welcomeAuthed(this.name, 'Mati');
+      await this._sendWelcomeWithEffects(ctx.api, welcome);
+
+      const { mainMenu } = require('../utils/menu');
+      const menu = mainMenu({ from: { id: this.uid, first_name: this.name } });
+      await ctx.api.sendMessage(this.uid, menu.text, {
+        reply_markup: menu.reply_markup,
+        parse_mode: menu.parse_mode
+      });
+
+    } catch (e) {
+      console.error('[Akun.login] post-start error:', e);
+      try { await ctx.api.sendMessage(this.uid, '⚠️ Masalah setelah login: ' + (e.message || e)); } catch {}
+      throw e;
+    }
   }
 
   cleanup(ctx) {

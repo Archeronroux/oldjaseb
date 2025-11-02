@@ -47,7 +47,7 @@ Selamat datang kembali di Ubot by @JaeHype!
 
 Ads : [Join Channel utama](https://t.me/PanoramaaStoree)`,
     needLogin: '❌ Login dulu',
-    askPhone: '📱 Kirim Nomor Telepon Anda (format: +628xxx):',
+    askPhone: '📱 Kirim Nomor Telepon Anda (format: +628xxx), atau tekan tombol "📂 Kirim Kontak 📂" di bawah.',
     invalidPhone: '❌ Format salah. Contoh: +6281234567890',
     otpInfo: `*Silakan kirim kode OTP yang masuk.*\nPisahkan angka dengan spasi (contoh: 2 4 5 6 3)`,
     passwordAsk: 'Kirim Password 2FA Anda',

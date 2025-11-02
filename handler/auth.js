@@ -1,3 +1,4 @@
+const { Keyboard } = require('grammy');
 const { getUser, users } = require('../utils/helper');
 const { mainMenu, helpCommand } = require('../utils/menu');
 const { saveState } = require('../utils/persist');
@@ -12,7 +13,13 @@ module.exports = (bot) => {
     acc.id = id;
     u.accounts.set(id, acc);
     ctx.session = { act: 'phone', id };
-    await ctx.reply(STR.messages.askPhone);
+
+    const kb = new Keyboard()
+      .requestContact('📂 Kirim Kontak 📂').row()
+      .text(STR.menu.back)
+      .resized();
+
+    await ctx.reply(STR.messages.askPhone, { reply_markup: kb });
   };
 
   bot.hears(STR.menu.createUserbot, handleLogin);

@@ -94,12 +94,14 @@ function entitlementGate() {
 
       ent.ensureUserFromCtx(ctx);
 
-      // Bypass untuk semua interaksi Shop/Trial dan navigasi tombol yang penting
       const isCb = !!ctx.callbackQuery;
       const data = String(ctx.callbackQuery?.data || '');
       const text = ctx.message?.text || '';
 
-      // gunakan STR.menu.* agar selalu sinkron dengan label keyboard
+      // Bypass flow interaktif (login, input nomor/OTP/2FA)
+      const inInteractiveFlow = !!ctx.session?.act;
+
+      // Bypass tombol penting
       const bypassTexts = new Set([
         STR.menu.tokenMenu,
         STR.menu.back,
@@ -108,28 +110,31 @@ function entitlementGate() {
         '🛒 Shop 🛒',
         '🎁 Uji coba 🎁',
         'Userbot Premium bulanan 💎',
-        'Kembali' // tambahan defensif
+        'Kembali'
       ]);
 
       const hasPhoto = Array.isArray(ctx.message?.photo) && ctx.message.photo.length > 0;
       const isImageDoc = ctx.message?.document && /^image\//i.test(ctx.message.document.mime_type || '');
+      const isContact = !!ctx.message?.contact;
+
+      // OTP 3-8 digit (boleh ada spasi antar digit)
+      const isOtpText = /^\s*(?:\d\s*){3,8}$/.test(text);
 
       const isShopCb = isCb && /^action:shop:/.test(data);
+      const isCancelCb = isCb && /^cancel_/.test(data);
       const isBypassText = bypassTexts.has(text);
       const isProofImage = !!(hasPhoto || isImageDoc);
 
-      if (isShopCb || isBypassText || isProofImage) {
+      if (isShopCb || isBypassText || isProofImage || isContact || isOtpText || inInteractiveFlow || isCancelCb) {
         return next();
       }
 
       const allowed = ent.isAllowed(ctx.from.id);
       if (allowed) return next();
 
-      // Jika tidak allowed: cek apakah masa trial/PRO baru saja berakhir, kirim notifikasi + token
       const didNotify = await maybeNotifyExpiry(ctx);
       if (didNotify) return;
 
-      // Gate default
       try {
         await ctx.reply(GATE_MESSAGE, { parse_mode: 'Markdown', reply_markup: gateKeyboard() });
       } catch {}

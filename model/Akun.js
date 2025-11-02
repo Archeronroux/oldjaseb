@@ -16,6 +16,11 @@ const DEBUG = process.env.DEBUG_BROADCAST === '1';
 const DEBUG_LOGIN = process.env.DEBUG_LOGIN === '1' || DEBUG;
 const FORCE_HTML = process.env.FORCE_HTML === '1';
 
+// Tweak jalur OTP via env (default: paksa SMS lebih cepat)
+const OTP_ALLOW_APP_HASH = process.env.OTP_ALLOW_APP_HASH === '1'; // default false
+const OTP_CURRENT_NUMBER = process.env.OTP_CURRENT_NUMBER === '1'; // default false
+const OTP_ALLOW_MISSED_CALL = process.env.OTP_ALLOW_MISSED_CALL === '1'; // default false
+
 const debugFile = path.join(sessionsDir, 'debug.log');
 function log(line) {
   if (!DEBUG) return;
@@ -54,17 +59,17 @@ class Akun {
 
     this.stats = { sent: 0, failed: 0, skip: 0, start: 0 };
 
-    this.pendingCode = null;
-    this.pendingPass = null;
+    // Flow OTP manual
+    this._login = null; // { phone, hash, canResendAt, needPass, infoText }
+    this._autoResendTimer = null;
+
+    this.pendingCode = null; // legacy fallback
+    this.pendingPass = null; // legacy fallback
     this.pendingMsgId = null;
 
     this._sourceCache = new Map();
     this.loadingMsgId = null;
     this._profileFetched = false;
-
-    // Login state (manual flow)
-    this._login = null; // { phone, hash, canResendAt, needPass }
-    this._lastSendError = null;
 
     // Resume helpers
     this.lastBetweenTick = 0;
@@ -195,65 +200,87 @@ class Akun {
       .text('❌ Batal', `cancel_${this.uid}`);
   }
 
+  _sentTypeToText(sentType) {
+    const t = (sentType && sentType.className) || '';
+    if (/SentCodeTypeApp/i.test(t)) return 'Telegram (in-app)';
+    if (/SentCodeTypeSms/i.test(t)) return 'SMS';
+    if (/SentCodeTypeCall/i.test(t)) return 'Panggilan';
+    if (/SentCodeTypeFlashCall/i.test(t)) return 'Flash call';
+    return 'Tidak diketahui';
+  }
+
   async _sendCode(ctx, phone) {
     const settings = new Api.CodeSettings({
       allowFlashcall: false,
-      currentNumber: true,
-      allowAppHash: true,
-      allowMissedCall: false,
+      currentNumber: !!OTP_CURRENT_NUMBER, // default false (hindari in-app routing)
+      allowAppHash: !!OTP_ALLOW_APP_HASH, // default false (hindari in-app routing)
+      allowMissedCall: !!OTP_ALLOW_MISSED_CALL,
       logoutTokens: []
     });
 
     const send = async () => {
-      ldbg('Sending code to', phone);
+      ldbg('Sending code to', phone, 'settings', {
+        allowFlashcall: settings.allowFlashcall,
+        currentNumber: settings.currentNumber,
+        allowAppHash: settings.allowAppHash,
+        allowMissedCall: settings.allowMissedCall
+      });
       const sent = await this.client.invoke(new Api.auth.SendCode({
         phoneNumber: phone,
         apiId: API_ID,
         apiHash: API_HASH,
         settings
       }));
-      // SentCode object has phoneCodeHash
       const hash = sent.phoneCodeHash || sent.phone_code_hash;
       if (!hash) throw new Error('Tidak dapat mengambil phoneCodeHash');
-      const canResendAfter = 25; // default cooldown; server bisa override
-      this._login = { phone, hash, canResendAt: Date.now() + canResendAfter * 1000, needPass: false };
-      ldbg('Code sent. hash=', hash);
+
+      const timeout = Number(sent.timeout || 0); // detik, jika ada
+      const via = this._sentTypeToText(sent.type);
+      const now = Date.now();
+      const canResendAt = timeout ? now + timeout*1000 : now + 30*1000;
+
+      this._login = {
+        phone,
+        hash,
+        canResendAt,
+        needPass: false,
+        infoText: `Kode dikirim via: ${via}${timeout?` • ETA ~${timeout}s`:''}`
+      };
+
+      ldbg('Code sent. hash=', hash, 'via=', via, 'timeout=', timeout || '(none)');
+      return { timeout, via };
     };
 
     try {
-      await send();
+      const res = await send();
+      await this._safeDeleteLoading(ctx);
+      const extra = res && res.timeout ? `\nPerkiraan tiba dalam ~${res.timeout}s.` : '';
+      await ctx.api.sendMessage(this.uid, `${STR.messages.otpInfo}\n${this._login.infoText}${extra}`, {
+        parse_mode: 'Markdown',
+        reply_markup: this._otpKeyboard()
+      });
     } catch (e) {
       const msg = String(e?.message || '').toUpperCase();
-      this._lastSendError = msg;
-      // Handle DC migrate immediately to avoid minutes delay
+      // Tangani MIGRATE agar tidak delay menunggu routing lama
       const m = msg.match(/(PHONE|NETWORK|USER)_MIGRATE_(\d+)/);
       if (m && m[2]) {
         const dcId = parseInt(m[2], 10);
         ldbg('Migrating to DC', dcId, 'then resend code.');
-        try {
-          // GramJS internal helper
-          if (typeof this.client._switchDC === 'function') {
-            await this.client._switchDC(dcId);
-          } else {
-            throw new Error('SwitchDC tidak tersedia');
-          }
-          await send();
-        } catch (e2) {
-          ldbg('Resend after migrate failed:', e2.message);
-          throw e2;
+        // Switch DC lalu kirim ulang
+        if (typeof this.client._switchDC === 'function') {
+          await this.client._switchDC(dcId);
+          const res2 = await send();
+          await this._safeDeleteLoading(ctx);
+          const extra = res2 && res2.timeout ? `\nPerkiraan tiba dalam ~${res2.timeout}s.` : '';
+          await ctx.api.sendMessage(this.uid, `${STR.messages.otpInfo}\n${this._login.infoText}${extra}`, {
+            parse_mode: 'Markdown',
+            reply_markup: this._otpKeyboard()
+          });
+          return;
         }
-      } else {
-        throw e;
       }
+      throw e;
     }
-
-    try {
-      await this._safeDeleteLoading(ctx);
-      await ctx.api.sendMessage(this.uid, STR.messages.otpInfo, {
-        parse_mode: 'Markdown',
-        reply_markup: this._otpKeyboard()
-      });
-    } catch {}
   }
 
   async _signInWithCode(ctx, code) {
@@ -319,8 +346,9 @@ class Akun {
       return;
     }
     const now = Date.now();
-    if (now < (this._login.canResendAt || 0)) {
-      const left = Math.ceil(((this._login.canResendAt || 0) - now) / 1000);
+    const allowAt = this._login.canResendAt || 0;
+    if (now < allowAt) {
+      const left = Math.ceil((allowAt - now)/1000);
       await ctx.answerCallbackQuery({ text: `Tunggu ${left}s sebelum kirim ulang.`, show_alert: true }).catch(()=>{});
       return;
     }
@@ -332,9 +360,17 @@ class Akun {
       }));
       const newHash = sent.phoneCodeHash || sent.phone_code_hash;
       if (newHash) this._login.hash = newHash;
-      // Set cooldown konservatif 25s
-      this._login.canResendAt = Date.now() + 25 * 1000;
-      await ctx.answerCallbackQuery({ text: 'Kode ulang dikirim. Cek Telegram Anda.', show_alert: false }).catch(()=>{});
+
+      const timeout = Number(sent.timeout || 0);
+      const via = this._sentTypeToText(sent.type);
+      const now2 = Date.now();
+      this._login.canResendAt = timeout ? now2 + timeout*1000 : now2 + 30*1000;
+      this._login.infoText = `Kode dikirim ulang via: ${via}${timeout?` • ETA ~${timeout}s`:''}`;
+
+      await ctx.answerCallbackQuery({ text: 'Kode ulang dikirim.', show_alert: false }).catch(()=>{});
+      try {
+        await ctx.api.sendMessage(this.uid, `${this._login.infoText}`, { parse_mode: 'Markdown', reply_markup: this._otpKeyboard() });
+      } catch {}
     } catch (e) {
       const msg = String(e?.message || '').toUpperCase();
       ldbg('Resend error:', msg);
@@ -374,7 +410,7 @@ class Akun {
     try { await this._safeDeleteLoading(ctx); } catch {}
   }
 
-  cleanup(ctx) {
+  async cleanup(ctx) {
     if (this.pendingMsgId && ctx) {
       ctx.api.deleteMessage(this.uid, this.pendingMsgId).catch(() => {});
       this.pendingMsgId = null;
@@ -384,7 +420,7 @@ class Akun {
   handleText(text, ctx) {
     const t = (text || '').trim();
 
-    // Step OTP manual
+    // OTP manual
     if (this._login && !this._login.needPass) {
       const code = t.replace(/\s+/g, '');
       if (/^\d{3,8}$/.test(code)) {
@@ -432,7 +468,7 @@ class Akun {
       return true;
     }
 
-    // Legacy pending resolvers (fallback)
+    // Legacy pending resolvers
     if (this.pendingCode) {
       try { this.pendingCode(t.replace(/\s+/g, '')); } catch {}
       this.pendingCode = null;
@@ -448,11 +484,24 @@ class Akun {
     return false;
   }
 
-  cancel(ctx) {
+  async cancel(ctx) {
+    // Batalkan state lokal
     this.pendingCode = null;
     this.pendingPass = null;
+    const phone = this._login?.phone;
+    const hash = this._login?.hash;
     this._login = null;
     this.cleanup(ctx);
+
+    // Batalkan di server agar request berikutnya tidak “menggantung”
+    if (phone && hash) {
+      try {
+        await this.client.invoke(new Api.auth.CancelCode({
+          phoneNumber: phone,
+          phoneCodeHash: hash
+        }));
+      } catch {}
+    }
   }
 
   _timeToTimestamp(hhmm) {

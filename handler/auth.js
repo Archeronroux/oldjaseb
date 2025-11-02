@@ -1,5 +1,5 @@
 const { Keyboard } = require('grammy');
-const { getUser, users } = require('../utils/helper');
+const { getUser, users, getAcc } = require('../utils/helper');
 const { mainMenu, helpCommand } = require('../utils/menu');
 const { saveState } = require('../utils/persist');
 const Akun = require('../model/Akun');
@@ -23,7 +23,7 @@ module.exports = (bot) => {
   };
 
   bot.hears(STR.menu.createUserbot, handleLogin);
-  bot.hears('➕ Tambah Sesi Baru', handleLogin); // fallback lama bila masih ada
+  bot.hears('➕ Tambah Sesi Baru', handleLogin);
 
   bot.hears('👥 Akun', async (ctx) => {
     const u = getUser(ctx.from.id);
@@ -44,15 +44,16 @@ module.exports = (bot) => {
     await ctx.reply(`Fitur ganti sesi dinonaktifkan. Gunakan ${STR.menu.tokenMenu} untuk backup/restore data.`);
   });
 
+  // Cancel flow
   bot.callbackQuery(/cancel_(.+)/, async (ctx) => {
-    const userId = ctx.match[1];
+    const userId = Number(ctx.match[1]);
     const u = getUser(userId);
-    for (const [id, acc] of u.accounts) {
-      if (acc.uid === userId) {
-        acc.cancel(ctx);
-        u.accounts.delete(id);
-        break;
-      }
+    // Hapus akun yang sedang login (active)
+    if (u && u.active) {
+      const acc = u.accounts.get(u.active);
+      try { acc?.cancel?.(ctx); } catch {}
+      try { u.accounts.delete(u.active); } catch {}
+      u.active = null;
     }
     if (ctx.session?.mid) {
       try { await ctx.api.deleteMessage(userId, ctx.session.mid); } catch {}
@@ -63,5 +64,23 @@ module.exports = (bot) => {
     await ctx.reply(STR.messages.loginCancelled, { reply_markup: menu.reply_markup, parse_mode: menu.parse_mode });
     await ctx.answerCallbackQuery('❌ Batal');
     saveState(users);
+  });
+
+  // Resend code now (to speed up OTP arrival)
+  bot.callbackQuery(/resend_(.+)/, async (ctx) => {
+    const userId = Number(ctx.match[1]);
+    const acc = getAcc(userId) || (() => {
+      const u = getUser(userId);
+      return u?.active ? u.accounts.get(u.active) : null;
+    })();
+    if (!acc) {
+      try { await ctx.answerCallbackQuery({ text: 'Sesi tidak ditemukan.', show_alert: true }); } catch {}
+      return;
+    }
+    try {
+      await acc.resendCode(ctx);
+    } catch (e) {
+      try { await ctx.answerCallbackQuery({ text: e.message || 'Resend gagal', show_alert: true }); } catch {}
+    }
   });
 };

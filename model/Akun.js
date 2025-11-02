@@ -10,7 +10,7 @@ const {
   entitiesToHTML
 } = require('../utils/entities');
 const STR = require('../config/strings');
-const { getBot } = require('../utils/helper'); // tambahan untuk notifikasi otomatis
+const { getBot } = require('../utils/helper');
 
 const DEBUG = process.env.DEBUG_BROADCAST === '1';
 const DEBUG_LOGIN = process.env.DEBUG_LOGIN === '1' || DEBUG;
@@ -62,12 +62,15 @@ class Akun {
     this.loadingMsgId = null;
     this._profileFetched = false;
 
+    // Login state (manual flow)
+    this._login = null; // { phone, hash, canResendAt, needPass }
+    this._lastSendError = null;
+
     // Resume helpers
     this.lastBetweenTick = 0;
     this.lastAllTick = 0;
   }
 
-  // ---- Helper logging internal ----
   _log(...a) { if (DEBUG) console.log('[AKUN]', this.uid, ...a); }
 
   _lazyPersist() {
@@ -89,7 +92,6 @@ class Akun {
     );
   }
 
-  // Deteksi error sesi yang "dikeluarkan" dari Telegram
   _isHardAuthError(e) {
     const m = String(e?.message || '').toUpperCase();
     return (
@@ -108,17 +110,16 @@ class Akun {
       if (!this._profileFetched) {
         try {
           const me = await this.client.getMe();
-            this.isPremium = !!me?.premium;
-            this.name = this.name || me?.firstName || me?.username || 'User';
-            this._profileFetched = true;
-            log(`[PROFILE] uid=${this.uid} premium=${this.isPremium}`);
+          this.isPremium = !!me?.premium;
+          this.name = this.name || me?.firstName || me?.username || 'User';
+          this._profileFetched = true;
+          log(`[PROFILE] uid=${this.uid} premium=${this.isPremium}`);
         } catch {}
       }
       return true;
     } catch (e) {
       console.error('[Akun.ensureClient] gagal connect:', e.message);
 
-      // Tambahan: jika sesi dicabut/dikeluarkan, reset dan arahkan ke menu login
       if (this._isHardAuthError(e)) {
         this.sess = '';
         this.authed = false;
@@ -187,97 +188,96 @@ class Akun {
     }
   }
 
-  // Perbaikan: pastikan client connect dulu, dan tambah logging/penanganan error agar OTP send failure terlihat
-  async login(ctx, phone) {
-    try {
-      const loading = await ctx.reply('⏳ *Tunggu sebentar...*', { parse_mode: 'Markdown' });
-      this.loadingMsgId = loading.message_id;
-    } catch {}
+  _otpKeyboard() {
+    const { InlineKeyboard } = require('grammy');
+    return new InlineKeyboard()
+      .text('🔁 Kirim Ulang', `resend_${this.uid}`).row()
+      .text('❌ Batal', `cancel_${this.uid}`);
+  }
 
-    // Inisialisasi client
-    try {
-      await this.init();
-    } catch (e) {
-      await this._safeDeleteLoading(ctx);
-      console.error('[Akun.login] init failed:', e);
-      try { await ctx.reply('❌ Gagal inisialisasi client: ' + (e.message || e)); } catch {}
-      throw e;
-    }
+  async _sendCode(ctx, phone) {
+    const settings = new Api.CodeSettings({
+      allowFlashcall: false,
+      currentNumber: true,
+      allowAppHash: true,
+      allowMissedCall: false,
+      logoutTokens: []
+    });
 
-    if (!this.client) {
-      await this._safeDeleteLoading(ctx);
-      return ctx.reply('❌ Gagal init client.');
-    }
-
-    // Pastikan terconnect sebelum start -- ini sering jadi penyebab OTP tidak dikirim
-    try {
-      if (!this.client.connected) {
-        ldbg('Connecting client before start()...');
-        await this.client.connect();
-        ldbg('Client connected.');
-      }
-    } catch (e) {
-      await this._safeDeleteLoading(ctx);
-      console.error('[Akun.login] client.connect failed:', e);
-      try { await ctx.reply('❌ Gagal connect ke Telegram: ' + (e.message || e)); } catch {}
-      throw e;
-    }
-
-    // Now start() with clearer error handling and debug logs
-    const onError = (err) => {
-      try { ctx.api.sendMessage(this.uid, `Error saat login: ${err.message || err}`); } catch {}
-      console.error('[Akun.login] start onError:', err);
+    const send = async () => {
+      ldbg('Sending code to', phone);
+      const sent = await this.client.invoke(new Api.auth.SendCode({
+        phoneNumber: phone,
+        apiId: API_ID,
+        apiHash: API_HASH,
+        settings
+      }));
+      // SentCode object has phoneCodeHash
+      const hash = sent.phoneCodeHash || sent.phone_code_hash;
+      if (!hash) throw new Error('Tidak dapat mengambil phoneCodeHash');
+      const canResendAfter = 25; // default cooldown; server bisa override
+      this._login = { phone, hash, canResendAt: Date.now() + canResendAfter * 1000, needPass: false };
+      ldbg('Code sent. hash=', hash);
     };
 
     try {
-      await this.client.start({
-        phoneNumber: () => phone,
-        phoneCode: () => new Promise(r => {
-          this.pendingCode = r;
-          this._safeDeleteLoading(ctx);
-          const { InlineKeyboard } = require('grammy');
-          ctx.api.sendMessage(this.uid, STR.messages.otpInfo, {
-            parse_mode: 'Markdown',
-            reply_markup: new InlineKeyboard().text('❌ Batal', `cancel_${this.uid}`)
-          }).then(msg => this.pendingMsgId = msg.message_id).catch(()=>{});
-          ldbg('Prompted user for OTP');
-        }),
-        password: () => new Promise(r => {
-          this.pendingPass = r;
-          this._safeDeleteLoading(ctx);
-          const { InlineKeyboard } = require('grammy');
-          ctx.api.sendMessage(this.uid, STR.messages.passwordAsk, {
-            reply_markup: new InlineKeyboard().text('❌ Batal', `cancel_${this.uid}`)
-          }).then(msg => this.pendingMsgId = msg.message_id).catch(()=>{});
-          ldbg('Prompted user for 2FA password');
-        }),
-        onError
-      });
+      await send();
     } catch (e) {
-      // jika start() gagal, laporkan ke user & log lebih lengkap
-      await this._safeDeleteLoading(ctx);
-      this.cleanup(ctx);
-      console.error('[Akun.login] client.start failed:', e && e.stack ? e.stack : e);
-      try { await ctx.reply('❌ Login gagal saat memulai proses (start): ' + (e.message || String(e))); } catch {}
-      // jika ini adalah error migrate DC atau hard auth -> coba laporkan khusus
-      if (String(e.message || '').toUpperCase().includes('MIGRATE')) {
-        ldbg('Start failed due to migrate DC:', e.message);
+      const msg = String(e?.message || '').toUpperCase();
+      this._lastSendError = msg;
+      // Handle DC migrate immediately to avoid minutes delay
+      const m = msg.match(/(PHONE|NETWORK|USER)_MIGRATE_(\d+)/);
+      if (m && m[2]) {
+        const dcId = parseInt(m[2], 10);
+        ldbg('Migrating to DC', dcId, 'then resend code.');
+        try {
+          // GramJS internal helper
+          if (typeof this.client._switchDC === 'function') {
+            await this.client._switchDC(dcId);
+          } else {
+            throw new Error('SwitchDC tidak tersedia');
+          }
+          await send();
+        } catch (e2) {
+          ldbg('Resend after migrate failed:', e2.message);
+          throw e2;
+        }
+      } else {
+        throw e;
       }
-      throw e;
     }
 
-    // Sukses start
     try {
+      await this._safeDeleteLoading(ctx);
+      await ctx.api.sendMessage(this.uid, STR.messages.otpInfo, {
+        parse_mode: 'Markdown',
+        reply_markup: this._otpKeyboard()
+      });
+    } catch {}
+  }
+
+  async _signInWithCode(ctx, code) {
+    if (!this._login?.hash || !this._login?.phone) {
+      await ctx.api.sendMessage(this.uid, '❌ Sesi login tidak valid. Ulangi dari awal.');
+      return;
+    }
+    ldbg('Signing in with code...');
+    try {
+      await this.client.invoke(new Api.auth.SignIn({
+        phoneNumber: this._login.phone,
+        phoneCodeHash: this._login.hash,
+        phoneCode: code
+      }));
+
+      // success
       this.sess = this.client.session.save();
       this.authed = true;
       const me = await this.client.getMe();
       this.name = me?.firstName || me?.username || 'User';
       this.isPremium = !!me?.premium;
       this._profileFetched = true;
+      this._login = null;
       this.cleanup(ctx);
-      await this._safeDeleteLoading(ctx);
-
-      ldbg(`[LOGIN_OK] uid=${this.uid} premium=${this.isPremium}`);
 
       try {
         const { saveState } = require('../utils/persist');
@@ -296,12 +296,82 @@ class Akun {
         reply_markup: menu.reply_markup,
         parse_mode: menu.parse_mode
       });
-
     } catch (e) {
-      console.error('[Akun.login] post-start error:', e);
-      try { await ctx.api.sendMessage(this.uid, '⚠️ Masalah setelah login: ' + (e.message || e)); } catch {}
-      throw e;
+      const up = String(e?.message || '').toUpperCase();
+      if (up.includes('SESSION_PASSWORD_NEEDED')) {
+        this._login.needPass = true;
+        try {
+          const { InlineKeyboard } = require('grammy');
+          await ctx.api.sendMessage(this.uid, STR.messages.passwordAsk, {
+            reply_markup: new InlineKeyboard().text('❌ Batal', `cancel_${this.uid}`)
+          });
+        } catch {}
+      } else {
+        console.error('[SignIn] error:', e);
+        try { await ctx.api.sendMessage(this.uid, '❌ Gagal login: ' + (e.message || e)); } catch {}
+      }
     }
+  }
+
+  async resendCode(ctx) {
+    if (!this._login?.phone || !this._login?.hash) {
+      await ctx.answerCallbackQuery({ text: 'Sesi login tidak ditemukan.', show_alert: true }).catch(()=>{});
+      return;
+    }
+    const now = Date.now();
+    if (now < (this._login.canResendAt || 0)) {
+      const left = Math.ceil(((this._login.canResendAt || 0) - now) / 1000);
+      await ctx.answerCallbackQuery({ text: `Tunggu ${left}s sebelum kirim ulang.`, show_alert: true }).catch(()=>{});
+      return;
+    }
+    try {
+      ldbg('Resending code...');
+      const sent = await this.client.invoke(new Api.auth.ResendCode({
+        phoneNumber: this._login.phone,
+        phoneCodeHash: this._login.hash
+      }));
+      const newHash = sent.phoneCodeHash || sent.phone_code_hash;
+      if (newHash) this._login.hash = newHash;
+      // Set cooldown konservatif 25s
+      this._login.canResendAt = Date.now() + 25 * 1000;
+      await ctx.answerCallbackQuery({ text: 'Kode ulang dikirim. Cek Telegram Anda.', show_alert: false }).catch(()=>{});
+    } catch (e) {
+      const msg = String(e?.message || '').toUpperCase();
+      ldbg('Resend error:', msg);
+      await ctx.answerCallbackQuery({ text: (e.message || 'Resend gagal'), show_alert: true }).catch(()=>{});
+    }
+  }
+
+  async login(ctx, phone) {
+    try {
+      const loading = await ctx.reply('⏳ *Tunggu sebentar...*', { parse_mode: 'Markdown' });
+      this.loadingMsgId = loading.message_id;
+    } catch {}
+
+    // Init & connect
+    try {
+      await this.init();
+      if (!this.client.connected) {
+        ldbg('Connecting client ...');
+        await this.client.connect();
+      }
+    } catch (e) {
+      await this._safeDeleteLoading(ctx);
+      console.error('[Akun.login] connect failed:', e);
+      try { await ctx.reply('❌ Gagal connect ke Telegram: ' + (e.message || e)); } catch {}
+      return;
+    }
+
+    try {
+      await this._sendCode(ctx, phone);
+    } catch (e) {
+      await this._safeDeleteLoading(ctx);
+      console.error('[Akun.login] send code failed:', e);
+      try { await ctx.reply('❌ Gagal meminta kode: ' + (e.message || e)); } catch {}
+      return;
+    }
+
+    try { await this._safeDeleteLoading(ctx); } catch {}
   }
 
   cleanup(ctx) {
@@ -312,14 +382,65 @@ class Akun {
   }
 
   handleText(text, ctx) {
+    const t = (text || '').trim();
+
+    // Step OTP manual
+    if (this._login && !this._login.needPass) {
+      const code = t.replace(/\s+/g, '');
+      if (/^\d{3,8}$/.test(code)) {
+        this._signInWithCode(ctx, code).catch(()=>{});
+        return true;
+      }
+      return false;
+    }
+
+    // 2FA password
+    if (this._login && this._login.needPass) {
+      const pass = t;
+      (async () => {
+        try {
+          await this.client.checkPassword(pass);
+          // logged in
+          this.sess = this.client.session.save();
+          this.authed = true;
+          const me = await this.client.getMe();
+          this.name = me?.firstName || me?.username || 'User';
+          this.isPremium = !!me?.premium;
+          this._profileFetched = true;
+          this._login = null;
+          this.cleanup(ctx);
+
+          try {
+            const { saveState } = require('../utils/persist');
+            const { users } = require('../utils/helper');
+            saveState(users);
+          } catch (e) {}
+
+          const welcome = STR.messages.welcomeAuthed(this.name, 'Mati');
+          await this._sendWelcomeWithEffects(ctx.api, welcome);
+
+          const { mainMenu } = require('../utils/menu');
+          const menu = mainMenu({ from: { id: this.uid, first_name: this.name } });
+          await ctx.api.sendMessage(this.uid, menu.text, {
+            reply_markup: menu.reply_markup,
+            parse_mode: menu.parse_mode
+          });
+        } catch (e) {
+          try { await ctx.api.sendMessage(this.uid, '❌ Password salah / gagal: ' + (e.message || e)); } catch {}
+        }
+      })();
+      return true;
+    }
+
+    // Legacy pending resolvers (fallback)
     if (this.pendingCode) {
-      try { this.pendingCode(text.replace(/\s+/g, '')); } catch {}
+      try { this.pendingCode(t.replace(/\s+/g, '')); } catch {}
       this.pendingCode = null;
       this.cleanup(ctx);
       return true;
     }
     if (this.pendingPass) {
-      try { this.pendingPass(text.trim()); } catch {}
+      try { this.pendingPass(t); } catch {}
       this.pendingPass = null;
       this.cleanup(ctx);
       return true;
@@ -330,6 +451,7 @@ class Akun {
   cancel(ctx) {
     this.pendingCode = null;
     this.pendingPass = null;
+    this._login = null;
     this.cleanup(ctx);
   }
 

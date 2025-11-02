@@ -111,6 +111,8 @@ const { startCommand: startCmdFromMenu } = require('./utils/menu');
 bot.command('start', startCmdFromMenu);
 bot.hears('⬅️ Kembali', startCmdFromMenu);
 
+// Tambahkan handler contact agar tombol "Kirim Kontak" aman diproses
+bot.on('message:contact', inputHandler);
 bot.on('message:text', inputHandler);
 
 function persistNow() { saveState(users); }

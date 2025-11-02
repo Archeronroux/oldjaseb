@@ -42,15 +42,16 @@ function writeDebugDump(uid, label, data) {
  * - Hapus spasi / tanda kurung / dash
  * - Jika mulai dengan 0 -> konversi ke +62 (Indonesia)
  * - Pastikan punya leading + dan 8-15 digit
+ * - Jika hanya digit 8-15 tanpa plus -> tambahkan +
  */
 function normalizePhone(raw) {
   if (!raw) return '';
   let s = String(raw).trim();
-  // hapus semua karakter kecuali digit dan plus
   s = s.replace(/[^\d+]/g, '');
   if (/^0\d+/.test(s)) {
     s = '+62' + s.slice(1);
   }
+  if (/^\d{8,15}$/.test(s) && !s.startsWith('+')) s = '+' + s;
   return s;
 }
 
@@ -70,7 +71,9 @@ module.exports = async (ctx) => {
 
   const actions = {
     phone: async () => {
-      const phoneRaw = String(text || '');
+      const contact = ctx.message?.contact;
+      const contactPhone = contact?.phone_number || '';
+      const phoneRaw = contactPhone || String(text || '');
       const phone = normalizePhone(phoneRaw);
       if (!/^\+\d{8,15}$/.test(phone)) {
         return ctx.reply(STR.messages.invalidPhone + '\nContoh: +6281234567890 (atau 081234567890 -> +6281234567890)');

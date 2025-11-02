@@ -10,6 +10,7 @@ const {
   entitiesToHTML
 } = require('../utils/entities');
 const STR = require('../config/strings');
+const { getBot } = require('../utils/helper'); // tambahan untuk notifikasi otomatis
 
 const DEBUG = process.env.DEBUG_BROADCAST === '1';
 const FORCE_HTML = process.env.FORCE_HTML === '1';
@@ -86,6 +87,17 @@ class Akun {
     );
   }
 
+  // Deteksi error sesi yang "dikeluarkan" dari Telegram
+  _isHardAuthError(e) {
+    const m = String(e?.message || '').toUpperCase();
+    return (
+      m.includes('AUTH_KEY_UNREGISTERED') ||
+      m.includes('SESSION_REVOKED') ||
+      m.includes('SESSION_EXPIRED') ||
+      m.includes('USER_DEACTIVATED')
+    );
+  }
+
   async ensureClient() {
     try {
       if (!this.sess) return false;
@@ -103,6 +115,35 @@ class Akun {
       return true;
     } catch (e) {
       console.error('[Akun.ensureClient] gagal connect:', e.message);
+
+      // Tambahan: jika sesi dicabut/dikeluarkan, reset dan arahkan ke menu login
+      if (this._isHardAuthError(e)) {
+        this.sess = '';
+        this.authed = false;
+        this._profileFetched = false;
+        try {
+          const { saveState } = require('../utils/persist');
+          const { users } = require('../utils/helper');
+          saveState(users);
+        } catch {}
+
+        try {
+          const api = getBot()?.api;
+          if (api) {
+            await api.sendMessage(this.uid, '⚠️ Sesi perangkat ini telah dikeluarkan dari Telegram. Silakan login ulang lewat menu "🤖 Buat Userbot 🤖".');
+            const { mainMenu } = require('../utils/menu');
+            const menu = mainMenu({ from: { id: this.uid, first_name: this.name || 'User' } });
+            await api.sendMessage(this.uid, menu.text, {
+              reply_markup: menu.reply_markup,
+              parse_mode: menu.parse_mode
+            });
+          }
+        } catch {}
+
+        try { await this.client?.disconnect?.(); } catch {}
+        this.client = null;
+      }
+
       return false;
     }
   }
@@ -403,29 +444,20 @@ class Akun {
     return false;
   }
 
-  /**
-   * START BROADCAST (dengan dukungan manual override).
-   * @param {*} botApi
-   * @param {{manual?:boolean}} options
-   * @returns {{ok:boolean,reason?:string}}
-   */
   async start(botApi, options = {}) {
     const manual = !!options.manual;
 
-    // Already running?
     if (this.running) {
       this._log('start(): already running');
       return { ok: false, reason: 'already_running' };
     }
 
-    // Manual override: batalkan timer terjadwal jika ada.
     if (manual && this._startTimer) {
       clearTimeout(this._startTimer);
       this._startTimer = null;
       this._log('start(): manual override cleared _startTimer');
     }
 
-    // Jika bukan manual dan masih ada _startTimer aktif -> tolak.
     if (!manual && this._startTimer) {
       this._log('start(): scheduled pending (not manual)');
       return { ok: false, reason: 'scheduled_pending' };
@@ -437,7 +469,6 @@ class Akun {
     const okEnsure = await this.ensureClient();
     if (!okEnsure) return { ok:false, reason:'client_not_connected' };
 
-    // Abaikan startTime bila manual
     if (!manual && this.startTime) {
       const ts = this._timeToTimestamp(this.startTime);
       if (ts && ts > Date.now() + 1500) {
@@ -451,12 +482,10 @@ class Akun {
       }
     }
 
-    // Langsung mulai
     this._doStart(botApi, { resume:false, manual });
     return { ok:true };
   }
 
-  // INTERNAL DO START
   _doStart(botApi, { resume=false, manual=false } = {}) {
     if (this.running) return;
     this.running = true;
@@ -488,9 +517,6 @@ class Akun {
     }
   }
 
-  /**
-   * Resume loop dari state (tanpa reset idx/msgIdx).
-   */
   resume(botApi) {
     if (this.running) return { ok:false, reason:'already_running' };
     if (!this.msgs.length || (!this.targets.size && !this.all))
